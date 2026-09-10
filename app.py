@@ -33,6 +33,11 @@ ROUTE_RE = re.compile(
     r"(?P<ai>запрос\s+(?P<target>[\w .-]{1,40})))\s*[:—–,-]\s*(?P<content>.+)$",
     re.IGNORECASE,
 )
+QUESTION_RE = re.compile(
+    r"(?:\?|\b(?:кто|что|где|когда|зачем|почему|как|сколько|какой|какая|какие|можешь|будешь|сможешь|скажешь|подскажешь)\b)",
+    re.IGNORECASE,
+)
+DIRECT_ADDRESS_RE = re.compile(r"\b(?:ты|тебе|твой|твоя|тебя|у тебя)\b", re.IGNORECASE)
 
 
 def now_iso() -> str:
@@ -164,6 +169,27 @@ class BridgeStore:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS person_profiles (
+                    uid TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    turns INTEGER NOT NULL DEFAULT 0,
+                    facts_json TEXT NOT NULL DEFAULT '[]',
+                    style_json TEXT NOT NULL DEFAULT '{}',
+                    PRIMARY KEY (uid, name)
+                );
+                CREATE TABLE IF NOT EXISTS live_answers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    uid TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    speaker TEXT NOT NULL,
+                    question TEXT NOT NULL,
+                    suggestion TEXT NOT NULL,
+                    confidence TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(uid, session_id, question)
+                );
                 """
             )
 
@@ -193,7 +219,7 @@ class BridgeStore:
             row = None
             if session_id:
                 row = con.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
-            if not row:
+            if not row and not session_id:
                 row = con.execute(
                     "SELECT * FROM sessions WHERE uid = ? AND status = 'capturing' ORDER BY updated_at DESC LIMIT 1", (uid,)
                 ).fetchone()
@@ -259,6 +285,88 @@ class BridgeStore:
                 )
             row = dict(con.execute("SELECT * FROM sessions WHERE id = ?", (session["id"],)).fetchone())
         return row, routes
+
+    def observe_people(self, uid: str, segments: list[dict[str, Any]]) -> None:
+        """Store reversible communication observations, not personality diagnoses."""
+        buckets: dict[str, list[str]] = {}
+        for segment in segments:
+            if segment.get("is_user"):
+                continue
+            name = safe_text(segment.get("speaker"), 120)
+            if not name or GENERIC_SPEAKER.match(name):
+                continue
+            buckets.setdefault(name, []).append(safe_text(segment.get("text"), 4_000))
+        with self.connection() as con:
+            for name, texts in buckets.items():
+                row = con.execute("SELECT * FROM person_profiles WHERE uid = ? AND name = ?", (uid, name)).fetchone()
+                turns = (int(row["turns"]) if row else 0) + len(texts)
+                total_words = sum(len(re.findall(r"[\wа-яё-]+", text, re.IGNORECASE)) for text in texts)
+                questions = sum(1 for text in texts if QUESTION_RE.search(text))
+                style = json.loads(row["style_json"]) if row else {"signals": []}
+                signals = style.get("signals", []) if isinstance(style, dict) else []
+                if total_words / max(1, len(texts)) <= 9 and "короткие реплики" not in signals:
+                    signals.append("короткие реплики")
+                if questions and "часто задаёт вопросы" not in signals:
+                    signals.append("часто задаёт вопросы")
+                style = {
+                    "signals": signals[:5],
+                    "confidence": "низкая" if turns < 4 else ("средняя" if turns < 12 else "выше средней"),
+                    "note": "Это рабочая модель стиля общения, а не оценка характера.",
+                }
+                facts = json.loads(row["facts_json"]) if row else []
+                for text in texts:
+                    if len(text) > 14 and text not in facts:
+                        facts.append(text[:280])
+                now = now_iso()
+                con.execute(
+                    """INSERT INTO person_profiles (uid, name, first_seen_at, last_seen_at, turns, facts_json, style_json)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(uid, name) DO UPDATE SET last_seen_at = excluded.last_seen_at, turns = excluded.turns,
+                       facts_json = excluded.facts_json, style_json = excluded.style_json""",
+                    (uid, name, row["first_seen_at"] if row else now, now, turns, json.dumps(facts[-20:], ensure_ascii=False), json.dumps(style, ensure_ascii=False)),
+                )
+
+    def profile(self, uid: str, name: str) -> dict[str, Any] | None:
+        with self.connection() as con:
+            row = con.execute("SELECT * FROM person_profiles WHERE uid = ? AND name = ?", (uid, name)).fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        result["facts"] = json.loads(result.pop("facts_json"))
+        result["style"] = json.loads(result.pop("style_json"))
+        return result
+
+    def profiles(self, uid: str) -> list[dict[str, Any]]:
+        with self.connection() as con:
+            rows = con.execute("SELECT * FROM person_profiles WHERE uid = ? ORDER BY last_seen_at DESC", (uid,)).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["style"] = json.loads(item.pop("style_json"))
+            item["facts"] = json.loads(item.pop("facts_json"))
+            result.append(item)
+        return result
+
+    def record_live_answer(self, uid: str, session_id: str, speaker: str, question: str, suggestion: str, confidence: str) -> bool:
+        with self.connection() as con:
+            recent = con.execute(
+                "SELECT created_at FROM live_answers WHERE uid = ? ORDER BY id DESC LIMIT 1", (uid,)
+            ).fetchone()
+            if recent and time.time() - datetime.fromisoformat(recent["created_at"]).timestamp() < 25:
+                return False
+            try:
+                con.execute(
+                    "INSERT INTO live_answers (uid, session_id, speaker, question, suggestion, confidence, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (uid, session_id, speaker, question, suggestion, confidence, now_iso()),
+                )
+                return True
+            except sqlite3.IntegrityError:
+                return False
+
+    def latest_live_answer(self, uid: str) -> dict[str, Any] | None:
+        with self.connection() as con:
+            row = con.execute("SELECT * FROM live_answers WHERE uid = ? ORDER BY id DESC LIMIT 1", (uid,)).fetchone()
+        return dict(row) if row else None
 
     def attach_omi_memory(self, session_id: str, payload: dict[str, Any]) -> None:
         memory_id = safe_text(payload.get("id"), 240)
@@ -560,6 +668,46 @@ def create_app(
     def endpoint_base(request: Request) -> str:
         return public_base_url or str(request.base_url).rstrip("/")
 
+    def field_mode(uid: str) -> str:
+        value = store.setting(f"field_mode:{uid}", "live")
+        return value if value in {"live", "meeting", "quiet", "stop"} else "live"
+
+    def build_live_notification(uid: str, session_id: str, segments: list[dict[str, Any]]) -> dict[str, Any] | None:
+        """Return one Omi proactive-notification request for an addressed, completed question."""
+        if field_mode(uid) in {"quiet", "stop"}:
+            return None
+        for segment in reversed(segments):
+            if segment.get("is_user"):
+                continue
+            question = safe_text(segment.get("text"), 500)
+            if not QUESTION_RE.search(question):
+                continue
+            speaker = safe_text(segment.get("speaker"), 120)
+            profile = store.profile(uid, speaker) if speaker and not GENERIC_SPEAKER.match(speaker) else None
+            signals = profile.get("style", {}).get("signals", []) if profile else []
+            compact_style = "одной очень прямой фразой" if "короткие реплики" in signals else "коротко и естественно"
+            addressee = "Вопрос явно обращён к владельцу устройства." if DIRECT_ADDRESS_RE.search(question) else "Это вероятный вопрос к владельцу устройства по ходу живого диалога."
+            suggestion = "Готовый ответ для живого разговора"
+            if not store.record_live_answer(uid, session_id, speaker or "Собеседник", question, suggestion, "вероятный"):
+                return None
+            prompt = (
+                "Ты создаёшь одну безопасную подсказку владельцу Omi для ответа вслух. "
+                f"Собеседник: {speaker or 'Собеседник'}. Вопрос: «{question}». {addressee} "
+                f"Сформулируй ответ {compact_style}, максимум 140 символов. "
+                "Используй только текущий контекст и известные факты пользователя. "
+                "Не выдавай предположение за факт; если данных мало, предложи коротко уточнить. "
+                "Не пиши заголовок, объяснение, предупреждение или Markdown — только готовую фразу."
+            )
+            return {
+                "session_id": session_id,
+                "notification": {
+                    "prompt": prompt,
+                    "params": ["user_name", "user_facts", "user_context"],
+                },
+                "field": {"speaker": speaker or "Собеседник", "question": question, "confidence": "вероятный"},
+            }
+        return None
+
     @app.middleware("http")
     async def protect_remote_dashboard(request: Request, call_next: Any) -> Any:
         if (
@@ -757,6 +905,30 @@ def create_app(
     def status() -> dict[str, Any]:
         return {**store.status(), "default_secret": hmac.compare_digest(webhook_secret, DEFAULT_SECRET)}
 
+    @app.get("/api/field/state")
+    def field_state(uid: str) -> dict[str, Any]:
+        uid = check_owner(uid)
+        return {
+            "mode": field_mode(uid),
+            "latest_answer": store.latest_live_answer(uid),
+            "people": len(store.profiles(uid)),
+            "drive_mirror_configured": bool(store.setting("drive_mirror_root")),
+        }
+
+    @app.put("/api/field/mode")
+    async def set_field_mode(request: Request) -> dict[str, str]:
+        body = await request.json()
+        uid = check_owner(safe_text(body.get("uid") if isinstance(body, dict) else "", 240))
+        mode = safe_text(body.get("mode") if isinstance(body, dict) else "", 32)
+        if mode not in {"live", "meeting", "quiet", "stop"}:
+            raise HTTPException(status_code=422, detail="Mode must be live, meeting, quiet, or stop")
+        store.set_setting(f"field_mode:{uid}", mode)
+        return {"mode": mode}
+
+    @app.get("/api/field/people")
+    def field_people(uid: str) -> list[dict[str, Any]]:
+        return store.profiles(check_owner(uid))
+
     @app.get("/api/ai/status")
     def ai_status() -> dict[str, Any]:
         base_url = os.environ.get("OMI_BRIDGE_AI_BASE_URL", "")
@@ -912,7 +1084,14 @@ def create_app(
             raise HTTPException(status_code=422, detail="Expected a segment array")
         session = store.active_session(uid, session_id)
         updated, detected_routes = store.append_segments(session, segments)
-        return {"session_id": updated["id"], "accepted_segments": len(segments), "routes": detected_routes}
+        stored_segments = json.loads(updated["segments_json"])
+        fresh_segments = stored_segments[-len(segments):] if segments else []
+        store.observe_people(uid, fresh_segments)
+        notification = build_live_notification(uid, updated["id"], fresh_segments)
+        result: dict[str, Any] = {"session_id": updated["id"], "accepted_segments": len(segments), "routes": detected_routes}
+        if notification:
+            result.update(notification)
+        return result
 
     @app.post("/api/webhooks/omi/{candidate_secret}/memory")
     async def receive_memory(candidate_secret: str, request: Request, uid: str = "local-user") -> dict[str, Any]:

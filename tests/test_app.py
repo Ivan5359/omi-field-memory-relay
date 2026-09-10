@@ -147,3 +147,43 @@ def test_remote_dashboard_api_is_hidden_without_its_separate_key(tmp_path: Path,
     assert client.get("/api/health").status_code == 200
     assert client.get("/api/sessions").status_code == 404
     assert client.get("/api/sessions", headers={"X-Omi-Bridge-Key": "dashboard-secret"}).status_code == 200
+
+
+def test_live_answer_radar_builds_one_short_omi_notification_and_learns_style(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    response = client.post(
+        "/api/webhooks/omi/test-secret/live?uid=me&session_id=father-test",
+        json=[{"text": "Ты сможешь приехать сегодня?", "speaker_name": "Папа", "is_user": False, "start": 1}],
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["notification"]["params"] == ["user_name", "user_facts", "user_context"]
+    assert "140" in payload["notification"]["prompt"]
+    assert payload["field"]["speaker"] == "Папа"
+
+    profile = client.get("/api/field/people?uid=me")
+    assert profile.status_code == 200
+    assert profile.json()[0]["name"] == "Папа"
+    assert profile.json()[0]["style"]["confidence"] == "низкая"
+
+    # The same Omi delivery is idempotent and must never make another push request.
+    duplicate = client.post(
+        "/api/webhooks/omi/test-secret/live?uid=me&session_id=father-test",
+        json=[{"text": "Ты сможешь приехать сегодня?", "speaker_name": "Папа", "is_user": False, "start": 1}],
+    )
+    assert duplicate.status_code == 200
+    assert "notification" not in duplicate.json()
+
+
+def test_field_mode_stops_live_answer_but_keeps_the_source_conversation(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    client.post("/api/webhooks/omi/test-secret/live?uid=me&session_id=pair", json=[{"text": "Привет", "is_user": True}])
+    mode = client.put("/api/field/mode", json={"uid": "me", "mode": "stop"})
+    assert mode.status_code == 200
+    response = client.post(
+        "/api/webhooks/omi/test-secret/live?uid=me&session_id=quiet-test",
+        json=[{"text": "Ты будешь сегодня?", "speaker_name": "Папа", "is_user": False}],
+    )
+    assert response.status_code == 200
+    assert "notification" not in response.json()
+    assert client.get("/api/sessions/quiet-test").status_code == 200

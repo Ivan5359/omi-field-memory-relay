@@ -1,13 +1,16 @@
 # OMI FIELD//MEMORY Relay
 
-Private Omi App backend for one person. It receives only **new completed Omi conversations**, keeps source segments locally, and exposes four chat tools inside the official Omi iPhone app:
+Private Omi mini-app backend for one person. It keeps a source-backed archive and has two layers inside the official Omi iPhone app:
+
+- **Answer Radar** receives live transcript segments, learns a reversible communication-style profile for named speakers, and returns one compact proactive-notification prompt when another person asks the wearer a question;
+- completed conversations are kept as source segments and exposed through four chat tools:
 
 - search the captured archive;
 - compile a source-backed dossier/timeline;
 - prepare an Obsidian Markdown draft (without automatically writing it anywhere);
 - show capture status.
 
-It is not an always-listening tracker, does not read Omi tasks, and does not request access to historical conversations or memories.
+It is not an always-listening tracker, does not read Omi tasks, and does not request access to historical conversations or memories. Communication profiles are observations with confidence, not character diagnoses; they can be deleted with the source archive.
 
 ## Run locally
 
@@ -31,15 +34,23 @@ Fill these only after the relay has a real HTTPS root such as `https://relay.exa
 
 | Omi field | Value |
 | --- | --- |
-| Trigger Event | `Conversation Creation` |
-| Webhook URL | `https://relay.example.com/api/webhooks/omi/<OMI_BRIDGE_SECRET>/memory` |
+| Trigger Event | `Transcript Processed` |
+| Webhook URL | `https://relay.example.com/api/webhooks/omi/<OMI_BRIDGE_SECRET>/live` |
 | App Home URL | `https://relay.example.com/` |
 | Setup Completed URL | `https://relay.example.com/setup?uid={{uid}}` |
 | Chat Tools Manifest URL | `https://relay.example.com/.well-known/omi-tools.json` |
 | Auth URL | leave empty |
-| Scopes | all off |
+| External-data scopes | all off |
+| Notification scopes | User name, User data, User conversations |
 
-Use `Chat`, `Conversations`, and `External Integration` capabilities. The app stays private.
+Use `Chat`, `Conversations`, `External Integration`, and `Notifications` capabilities. The app stays private. Omi limits proactive notifications, so Answer Radar deliberately sends only one likely addressed question at a time.
+
+### Answer Radar test
+
+1. Deploy the same repository to a private HTTPS endpoint and configure the fields above.
+2. Enable the OMI FIELD mini-app in Omi.
+3. Ask a named second speaker to say one direct question, then wait at least 30 seconds before repeating a test.
+4. Omi should receive a compact suggested reply. The server stores the incoming source segment and its non-diagnostic style observations under that speaker name.
 
 ### Chat prompt
 
@@ -60,4 +71,3 @@ Create a compact, durable field record from this conversation. Preserve exact fa
 python -m pytest tests -q
 python -m compileall -q app.py
 ```
-
