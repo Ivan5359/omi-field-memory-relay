@@ -296,6 +296,7 @@ class BridgeStore:
             if not name or GENERIC_SPEAKER.match(name):
                 continue
             buckets.setdefault(name, []).append(safe_text(segment.get("text"), 4_000))
+        updated_names: list[str] = []
         with self.connection() as con:
             for name, texts in buckets.items():
                 row = con.execute("SELECT * FROM person_profiles WHERE uid = ? AND name = ?", (uid, name)).fetchone()
@@ -325,6 +326,40 @@ class BridgeStore:
                        facts_json = excluded.facts_json, style_json = excluded.style_json""",
                     (uid, name, row["first_seen_at"] if row else now, now, turns, json.dumps(facts[-20:], ensure_ascii=False), json.dumps(style, ensure_ascii=False)),
                 )
+                updated_names.append(name)
+        for name in updated_names:
+            self.mirror_profile(uid, name)
+
+    def mirror_profile(self, uid: str, name: str) -> None:
+        """Write a portable Markdown profile when the user chose a Google Drive desktop folder."""
+        root = self.setting("drive_mirror_root")
+        profile = self.profile(uid, name)
+        if not root or not profile:
+            return
+        root_path = Path(root).expanduser().resolve()
+        if not root_path.is_dir():
+            return
+        safe_name = re.sub(r'[<>:"/\\|?*]', "-", name).strip(". ") or "speaker"
+        target = root_path / "OMI FIELD" / "People" / f"{safe_name}.md"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        style = profile["style"]
+        lines = [
+            f"# {name}",
+            "",
+            "_OMI FIELD communication profile — observations, not a character diagnosis._",
+            "",
+            f"- First seen: {profile['first_seen_at']}",
+            f"- Last seen: {profile['last_seen_at']}",
+            f"- Conversation turns: {profile['turns']}",
+            f"- Confidence: {style.get('confidence', 'low')}",
+            "",
+            "## Communication signals",
+        ]
+        lines.extend(f"- {signal}" for signal in style.get("signals", []) or ["Not enough evidence yet."])
+        lines.extend(["", "## Source snippets", *[f"> {fact}" for fact in profile["facts"][-10:]]])
+        temporary = target.with_suffix(".partial")
+        temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        os.replace(temporary, target)
 
     def profile(self, uid: str, name: str) -> dict[str, Any] | None:
         with self.connection() as con:

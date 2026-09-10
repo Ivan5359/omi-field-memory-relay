@@ -187,3 +187,16 @@ def test_field_mode_stops_live_answer_but_keeps_the_source_conversation(tmp_path
     assert response.status_code == 200
     assert "notification" not in response.json()
     assert client.get("/api/sessions/quiet-test").status_code == 200
+
+
+def test_person_profile_is_mirrored_as_markdown_to_the_chosen_drive_folder(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    client.put("/api/settings/drive-mirror", json={"path": str(tmp_path)})
+    response = client.post(
+        "/api/webhooks/omi/test-secret/live?uid=me&session_id=drive-person",
+        json=[{"text": "Мне удобнее коротко, без долгих объяснений.", "speaker_name": "Папа", "is_user": False}],
+    )
+    assert response.status_code == 200
+    profile_file = tmp_path / "OMI FIELD" / "People" / "Папа.md"
+    assert profile_file.is_file()
+    assert "communication profile" in profile_file.read_text(encoding="utf-8")
