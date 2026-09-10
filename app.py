@@ -707,23 +707,50 @@ def create_app(
         value = store.setting(f"field_mode:{uid}", "live")
         return value if value in {"live", "meeting", "quiet", "stop"} else "live"
 
-    def build_live_notification(uid: str, session_id: str, segments: list[dict[str, Any]]) -> dict[str, Any] | None:
+    def question_address(question: str, speaker: str, conversation: list[dict[str, Any]]) -> tuple[str, str] | None:
+        """Infer addressee conservatively; transcript diarization has no explicit addressee field."""
+        mentioned_other = {
+            safe_text(item.get("speaker"), 120)
+            for item in conversation
+            if not item.get("is_user")
+            and safe_text(item.get("speaker"), 120)
+            and safe_text(item.get("speaker"), 120).lower() != speaker.lower()
+            and not GENERIC_SPEAKER.match(safe_text(item.get("speaker"), 120))
+        }
+        if any(re.search(rf"(?<!\\w){re.escape(name)}(?!\\w)", question, re.IGNORECASE) for name in mentioned_other):
+            return None
+        if DIRECT_ADDRESS_RE.search(question):
+            return ("высокая", "Вопрос прямо обращён к владельцу устройства.")
+
+        other_speakers = {
+            safe_text(item.get("speaker"), 120).lower()
+            for item in conversation
+            if not item.get("is_user") and safe_text(item.get("speaker"), 120) and not GENERIC_SPEAKER.match(safe_text(item.get("speaker"), 120))
+        }
+        if speaker and speaker.lower() in other_speakers and len(other_speakers) == 1:
+            return ("средняя", "Вопрос без имени, но в разговоре участвует один собеседник.")
+        return None
+
+    def build_live_notification(uid: str, session_id: str, new_segments: list[dict[str, Any]], conversation: list[dict[str, Any]]) -> dict[str, Any] | None:
         """Return one Omi proactive-notification request for an addressed, completed question."""
         if field_mode(uid) in {"quiet", "stop"}:
             return None
-        for segment in reversed(segments):
+        for segment in reversed(new_segments):
             if segment.get("is_user"):
                 continue
             question = safe_text(segment.get("text"), 500)
             if not QUESTION_RE.search(question):
                 continue
             speaker = safe_text(segment.get("speaker"), 120)
+            address = question_address(question, speaker, conversation)
+            if not address:
+                continue
+            confidence, addressee = address
             profile = store.profile(uid, speaker) if speaker and not GENERIC_SPEAKER.match(speaker) else None
             signals = profile.get("style", {}).get("signals", []) if profile else []
             compact_style = "одной очень прямой фразой" if "короткие реплики" in signals else "коротко и естественно"
-            addressee = "Вопрос явно обращён к владельцу устройства." if DIRECT_ADDRESS_RE.search(question) else "Это вероятный вопрос к владельцу устройства по ходу живого диалога."
             suggestion = "Готовый ответ для живого разговора"
-            if not store.record_live_answer(uid, session_id, speaker or "Собеседник", question, suggestion, "вероятный"):
+            if not store.record_live_answer(uid, session_id, speaker or "Собеседник", question, suggestion, confidence):
                 return None
             prompt = (
                 "Ты создаёшь одну безопасную подсказку владельцу Omi для ответа вслух. "
@@ -739,7 +766,7 @@ def create_app(
                     "prompt": prompt,
                     "params": ["user_name", "user_facts", "user_context"],
                 },
-                "field": {"speaker": speaker or "Собеседник", "question": question, "confidence": "вероятный"},
+                "field": {"speaker": speaker or "Собеседник", "question": question, "confidence": confidence},
             }
         return None
 
@@ -791,7 +818,7 @@ def create_app(
     def app_home() -> HTMLResponse:
         return HTMLResponse(
             """<!doctype html><html lang=\"ru\"><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>OMI FIELD//MEMORY</title>
-            <style>body{margin:0;background:#111312;color:#e7e2d8;font:16px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif}main{max-width:620px;margin:0 auto;padding:48px 24px}code{color:#ff5a36}p{color:#b5b7b6;line-height:1.55}.tag{font:12px ui-monospace,monospace;color:#9ba4a4;letter-spacing:.12em}</style></head><body><main><div class=\"tag\">PRIVATE OMI APP · FIELD RELAY</div><h1>Память с источниками.</h1><p>Приложение принимает только новые завершённые разговоры из Omi. Поиск, досье и Obsidian-черновики доступны в чате Omi.</p><p>Архив не публикуется и не передаётся в сторонние ИИ без отдельного действия.</p><p><code>STATUS: READY FOR PAIRING</code></p></main></body></html>"""
+            <style>body{margin:0;background:#111312;color:#e7e2d8;font:16px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif}main{max-width:620px;margin:0 auto;padding:48px 24px}code{color:#ff5a36}p{color:#b5b7b6;line-height:1.55}.tag{font:12px ui-monospace,monospace;color:#9ba4a4;letter-spacing:.12em}</style></head><body><main><div class=\"tag\">PRIVATE OMI MINI-APP · FIELD RELAY</div><h1>Контекст для живого разговора.</h1><p>OMI FIELD получает новые фрагменты речи, пропускает неадресованные вопросы и возвращает короткую подсказку на экран iPhone. После разговора сохраняет только источники, профили общения и заметки в выбранный архив.</p><p>Это надстройка внутри Omi, а не отдельное приложение. Никаких диагнозов личности: только удаляемые наблюдения по стилю общения с указанием уверенности.</p><p><code>STATUS: READY FOR PAIRING</code></p></main></body></html>"""
         )
 
     @app.get("/health")
@@ -1122,7 +1149,7 @@ def create_app(
         stored_segments = json.loads(updated["segments_json"])
         fresh_segments = stored_segments[-len(segments):] if segments else []
         store.observe_people(uid, fresh_segments)
-        notification = build_live_notification(uid, updated["id"], fresh_segments)
+        notification = build_live_notification(uid, updated["id"], fresh_segments, stored_segments)
         result: dict[str, Any] = {"session_id": updated["id"], "accepted_segments": len(segments), "routes": detected_routes}
         if notification:
             result.update(notification)

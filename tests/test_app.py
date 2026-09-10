@@ -160,6 +160,7 @@ def test_live_answer_radar_builds_one_short_omi_notification_and_learns_style(tm
     assert payload["notification"]["params"] == ["user_name", "user_facts", "user_context"]
     assert "140" in payload["notification"]["prompt"]
     assert payload["field"]["speaker"] == "Папа"
+    assert payload["field"]["confidence"] == "высокая"
 
     profile = client.get("/api/field/people?uid=me")
     assert profile.status_code == 200
@@ -173,6 +174,20 @@ def test_live_answer_radar_builds_one_short_omi_notification_and_learns_style(tm
     )
     assert duplicate.status_code == 200
     assert "notification" not in duplicate.json()
+
+
+def test_live_answer_radar_skips_an_ambiguous_question_in_a_group(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    response = client.post(
+        "/api/webhooks/omi/test-secret/live?uid=me&session_id=group-test",
+        json=[
+            {"text": "Марина, ты уже отправила письмо?", "speaker_name": "Папа", "is_user": False},
+            {"text": "Нет, ещё не успела.", "speaker_name": "Марина", "is_user": False},
+            {"text": "Когда отправишь?", "speaker_name": "Папа", "is_user": False},
+        ],
+    )
+    assert response.status_code == 200
+    assert "notification" not in response.json()
 
 
 def test_field_mode_stops_live_answer_but_keeps_the_source_conversation(tmp_path: Path) -> None:
